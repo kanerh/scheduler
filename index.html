@@ -15,15 +15,11 @@
     .row { display:flex; gap:10px; flex-wrap: wrap; align-items:flex-end; }
     .col { flex: 1 1 220px; min-width: 220px; }
     label { display:block; font-size: 12px; color:#333; margin-bottom: 6px; }
-    input[type="text"], input[type="date"], input[type="time"], textarea {
+    input[type="text"], input[type="date"], input[type="time"], textarea, select {
       width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid #d7d9e3; background:#fff; outline:none;
     }
     textarea { min-height: 76px; resize: vertical; }
-    select { width:100%; padding: 10px 12px; border-radius: 12px; border: 1px solid #d7d9e3; background:#fff; }
-    .btn {
-      appearance:none; border: 0; border-radius: 12px; padding: 10px 12px;
-      background:#111; color:#fff; font-weight: 700; cursor:pointer;
-    }
+    .btn { appearance:none; border: 0; border-radius: 12px; padding: 10px 12px; background:#111; color:#fff; font-weight: 700; cursor:pointer; }
     .btn.secondary { background: #fff; color:#111; border: 1px solid #d7d9e3; }
     .btn.danger { background: #b00020; }
     .btn:disabled { opacity:.55; cursor:not-allowed; }
@@ -165,22 +161,20 @@ function computeOptionRanking(meeting){
   return { items, mandatoryNames, hasPerfectMandatory };
 }
 
-const STORE_KEY = "meeting_picker_local_v1";
-
+const STORE_KEY = "meeting_picker_local_v2";
 function loadStore(){
   const raw = localStorage.getItem(STORE_KEY);
-  if (!raw) return { meetings: {} };
+  if (!raw) return { meetings: {}, ui: {} };
   try{
     const json = JSON.parse(raw);
     if (!json.meetings) json.meetings = {};
+    if (!json.ui) json.ui = {};
     return json;
   } catch {
-    return { meetings: {} };
+    return { meetings: {}, ui: {} };
   }
 }
-function saveStore(store){
-  localStorage.setItem(STORE_KEY, JSON.stringify(store));
-}
+function saveStore(store){ localStorage.setItem(STORE_KEY, JSON.stringify(store)); }
 function purgeExpired(store){
   for (const [mid, m] of Object.entries(store.meetings || {})){
     if (m && meetingExpired(m)) delete store.meetings[mid];
@@ -192,15 +186,12 @@ function setMain(children){
   app.innerHTML = "";
   for (const c of children) app.appendChild(c);
 }
-
 function renderVoteBadge(v){
   const cls = v === Vote.GOOD ? "voteBadge vote-good" :
               v === Vote.MAYBE ? "voteBadge vote-maybe" :
               "voteBadge vote-no";
   return el("span", { class: cls }, VoteLabel[v] || "");
 }
-
-let uiState = { meName: "" };
 
 function renderHome(){
   const store = loadStore();
@@ -290,7 +281,6 @@ function renderHome(){
     renderMeeting(id);
   });
 
-  // list existing meetings (local)
   const existing = Object.values(store.meetings || {}).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0));
   const list = el("div",{class:"grid", style:"gap:10px;"});
   if (existing.length){
@@ -307,6 +297,10 @@ function renderHome(){
             el("button",{class:"btn danger secondary", type:"button", onclick: ()=>{
               if (!confirm("למחוק את הפגישה המקומית?")) return;
               delete store.meetings[m.id];
+              // ננקה גם בחירת משתתף שמורה אם מצביעה על פגישה שנמחקה
+              if (store.ui?.selectedParticipantByMeeting?.[m.id]) {
+                delete store.ui.selectedParticipantByMeeting[m.id];
+              }
               saveStore(store);
               renderHome();
             }}, "מחק")
@@ -361,10 +355,16 @@ function renderMeeting(meetingId){
 
   if (meetingExpired(meeting)){
     delete store.meetings[meetingId];
+    if (store.ui?.selectedParticipantByMeeting?.[meetingId]) {
+      delete store.ui.selectedParticipantByMeeting[meetingId];
+    }
     saveStore(store);
     setMain([ el("div",{class:"card alert"}, "פגישה זו פגה תוקף ונמחקה אוטומטית מקומית.") ]);
     return;
   }
+
+  store.ui = store.ui || {};
+  store.ui.selectedParticipantByMeeting = store.ui.selectedParticipantByMeeting || {};
 
   function persist(){
     purgeExpired(store);
@@ -372,37 +372,62 @@ function renderMeeting(meetingId){
     saveStore(store);
   }
 
-  const nameInput = el("input", { type:"text", placeholder:"השם שלך להצבעה", value: uiState.meName || "" });
-  nameInput.addEventListener("change", ()=> { uiState.meName = nameInput.value.trim(); renderMeeting(meetingId); });
-  function getMeName(){ return nameInput.value.trim(); }
+  // בחירת משתמש מתוך רשימה
+  const participantSelect = el("select", {});
+  participantSelect.appendChild(el("option",{value:""}, "בחר/י את שמך מהרשימה..."));
 
-  async function updateVote(optionId, vote){
-    const me = getMeName();
-    if (!me){ alert("נא להזין שם לפני הצבעה"); return; }
-    uiState.meName = me;
+  const participantNames = Object.keys(meeting.participants || {}).sort((a,b)=>a.localeCompare(b));
+  for (const name of participantNames){
+    participantSelect.appendChild(el("option",{value:name}, name));
+  }
 
-    if (!meeting.participants[me]) {
-      meeting.participants[me] = { mandatory: false };
-      addLog(meeting, "participant_add", me, { mandatory:false, via:"vote" });
+  // שחזור בחירה קודמת (לוקאלית בלבד)
+  const savedSel = store.ui.selectedParticipantByMeeting[meetingId] || "";
+  if (savedSel && meeting.participants[savedSel]) participantSelect.value = savedSel;
+
+  participantSelect.addEventListener("change", ()=>{
+    store.ui.selectedParticipantByMeeting[meetingId] = participantSelect.value || "";
+    saveStore(store);
+    renderMeeting(meetingId);
+  });
+
+  function getSelectedParticipant(){
+    const p = participantSelect.value || "";
+    return p;
+  }
+
+  function ensureParticipantSelected(){
+    const me = getSelectedParticipant();
+    if (!me){
+      alert("נא לבחור את שמך מהרשימה לפני הצבעה.");
+      return false;
     }
+    return true;
+  }
+
+  function updateVote(optionId, vote){
+    if (!ensureParticipantSelected()) return;
+    const me = getSelectedParticipant();
+
     const opt = meeting.options.find(o=>o.id === optionId);
     if (!opt) return;
     const prev = opt.votes?.[me];
     opt.votes = opt.votes || {};
     opt.votes[me] = vote;
-    addLog(meeting, prev ? "vote_update" : "vote_add", me, { optionId, vote });
 
+    addLog(meeting, prev ? "vote_update" : "vote_add", me, { optionId, vote });
     persist();
     renderMeeting(meetingId);
   }
 
-  // Participants
+  // Participants management
   const participantsList = el("div", { class:"grid", style:"gap:8px;" });
+
   function rebuildParticipantsUI(){
     participantsList.innerHTML = "";
     const entries = Object.entries(meeting.participants || {});
     if (!entries.length){
-      participantsList.appendChild(el("div",{class:"muted small"}, "אין משתתפים מוגדרים עדיין."));
+      participantsList.appendChild(el("div",{class:"muted small"}, "אין משתתפים מוגדרים עדיין. הוסף משתתפים כדי לאפשר הצבעה."));
       return;
     }
     for (const [pname, p] of entries.sort((a,b)=> a[0].localeCompare(b[0]))){
@@ -414,15 +439,24 @@ function renderMeeting(meetingId){
         persist();
         renderMeeting(meetingId);
       });
+
       const del = el("button", { class:"btn danger secondary", type:"button" }, "מחק");
       del.addEventListener("click", ()=>{
         if (!confirm(`למחוק את ${pname} ואת ההצבעות שלו?`)) return;
+
         delete meeting.participants[pname];
         for (const opt of meeting.options){
           if (opt.votes) delete opt.votes[pname];
         }
+
+        // אם המשתתף שנבחר נמחק — ננקה בחירה
+        if (store.ui.selectedParticipantByMeeting[meetingId] === pname){
+          store.ui.selectedParticipantByMeeting[meetingId] = "";
+        }
+
         addLog(meeting, "participant_delete", pname, {});
         persist();
+        saveStore(store);
         renderMeeting(meetingId);
       });
 
@@ -446,12 +480,24 @@ function renderMeeting(meetingId){
   const addPName = el("input", { type:"text", placeholder:"שם משתתף" });
   const addPMand = el("input", { type:"checkbox" });
   const addPBtn = el("button", { class:"btn secondary", type:"button" }, "הוסף משתתף");
+
   addPBtn.addEventListener("click", ()=>{
     const pname = addPName.value.trim();
     if (!pname) return;
+    if (meeting.participants[pname]){
+      alert("המשתתף כבר קיים.");
+      return;
+    }
     meeting.participants[pname] = { mandatory: addPMand.checked };
     addLog(meeting, "participant_add", pname, { mandatory: addPMand.checked });
     persist();
+
+    // ברירת מחדל: אם עדיין לא נבחר משתתף, נבחר את הראשון שהוסף
+    if (!store.ui.selectedParticipantByMeeting[meetingId]){
+      store.ui.selectedParticipantByMeeting[meetingId] = pname;
+      saveStore(store);
+    }
+
     renderMeeting(meetingId);
   });
 
@@ -471,30 +517,45 @@ function renderMeeting(meetingId){
 
     const opt = { id: "opt_" + shortId(5), date: addOD.value, startTime: addOST.value, endTime: addOET.value, votes: {} };
     meeting.options.push(opt);
-    addLog(meeting, "option_add", (uiState.meName || "משתתף"), { option: opt });
+
+    const by = getSelectedParticipant() || "משתתף";
+    addLog(meeting, "option_add", by, { option: opt });
+
     persist();
     renderMeeting(meetingId);
   });
 
-  // My vote cards
+  // My votes cards (based on selected participant)
   const voteCardWrap = el("div", { class:"grid" });
   function buildVoteCards(){
     voteCardWrap.innerHTML = "";
-    const me = uiState.meName || "";
+
+    const me = getSelectedParticipant(); // may be ""
+    if (!participantNames.length){
+      voteCardWrap.appendChild(el("div",{class:"alert"}, "אין משתתפים. הוסף משתתפים כדי לאפשר הצבעה."));
+      return;
+    }
+    if (!me){
+      voteCardWrap.appendChild(el("div",{class:"alert"}, "בחר/י את שמך מהרשימה כדי להצביע."));
+    }
+
     for (const opt of meeting.options){
-      const current = opt.votes?.[me] || "";
+      const current = me ? (opt.votes?.[me] || "") : "";
+
       const sel = el("select", {});
       sel.appendChild(el("option",{value:""}, "בחר..."));
       sel.appendChild(el("option",{value:Vote.GOOD}, VoteLabel[Vote.GOOD]));
       sel.appendChild(el("option",{value:Vote.MAYBE}, VoteLabel[Vote.MAYBE]));
       sel.appendChild(el("option",{value:Vote.NO}, VoteLabel[Vote.NO]));
       sel.value = current;
+      sel.disabled = !me;
+
       sel.addEventListener("change", ()=> { if (sel.value) updateVote(opt.id, sel.value); });
 
       voteCardWrap.appendChild(
         el("div",{class:"card"},
           el("div",{style:"font-weight:800; margin-bottom:6px;"}, formatOption(opt)),
-          el("div",{class:"muted small", style:"margin-bottom:8px;"}, "בחר את הזמינות שלך למועד הזה"),
+          el("div",{class:"muted small", style:"margin-bottom:8px;"}, me ? `הצבעה עבור: ${me}` : "בחר/י משתתף כדי להצביע"),
           sel,
           me && current ? el("div",{style:"margin-top:10px;"}, renderVoteBadge(current)) : null
         )
@@ -502,7 +563,6 @@ function renderMeeting(meetingId){
     }
   }
 
-  // Matrix
   function buildMatrix(){
     const names = Object.keys(meeting.participants || {}).sort((a,b)=>a.localeCompare(b));
     if (meeting.options.length === 0) return el("div",{class:"muted"}, "אין מועדים.");
@@ -532,7 +592,6 @@ function renderMeeting(meetingId){
     return table;
   }
 
-  // Optimization
   function buildOptimization(){
     const { items, mandatoryNames, hasPerfectMandatory } = computeOptionRanking(meeting);
     const wrap = el("div",{class:"grid", style:"gap:10px;"});
@@ -563,7 +622,6 @@ function renderMeeting(meetingId){
     return wrap;
   }
 
-  // Activity log
   function buildActivity(){
     const list = el("div",{class:"grid", style:"gap:8px;"});
     const log = meeting.activityLog || [];
@@ -591,18 +649,19 @@ function renderMeeting(meetingId){
       " · תפוגה: ", new Date(meeting.expiresAt).toLocaleString("he-IL")
     ),
     el("div",{class:"sep"}),
-    el("div",{class:"alert"},
-      "מצב מקומי בלבד: השינויים נשמרים רק בדפדפן הזה (localStorage)."
-    )
+    el("div",{class:"alert"}, "מצב מקומי בלבד: השינויים נשמרים רק בדפדפן הזה (localStorage).")
   );
 
   const voteCard = el("div",{class:"card"},
-    el("div",{style:"font-weight:800; margin-bottom:8px;"}, "ההצבעה שלי"),
+    el("div",{style:"font-weight:800; margin-bottom:8px;"}, "הצבעה"),
     el("div",{class:"row"},
-      el("div",{class:"col"}, el("label",{}, "השם שלי"), nameInput),
+      el("div",{class:"col"},
+        el("label",{}, "בחר/י את שמך מהרשימה"),
+        participantSelect
+      ),
     ),
     el("div",{class:"muted small", style:"margin-top:8px;"},
-      "אם תיכנס שוב עם אותו שם — התגובה תתעדכן."
+      "אין הקלדת שם — רק בחירה מתוך המשתתפים."
     ),
     el("div",{class:"sep"}),
     voteCardWrap
